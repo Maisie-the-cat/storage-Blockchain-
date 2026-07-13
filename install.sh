@@ -12,10 +12,14 @@
 #   • File upload, download (decrypted), preview, and JSON export
 #   • Modern SPA web frontend with auto-refresh
 #   • Systemd service for production use
+#   • Hardened deployment with secure credential storage
 # ============================================================================
 set -euo pipefail
 
-# ── Configuration ────────────────────────────────────────────────────────────
+# ── Error Handling ───────────────────────────────────────────────────────────
+trap 'error "Installation failed at line $LINENO"; exit 1' ERR
+
+# ── Configuration ─────────────────────────────────────────────────────────────
 INSTALL_DIR="/opt/blockchain_vault"
 MYSQL_ROOT_PASS=$(openssl rand -base64 16 | tr -d '\n')
 MYSQL_DB="blockchain_vault"
@@ -23,9 +27,10 @@ MYSQL_USER="vault_app"
 MYSQL_PASS=$(openssl rand -base64 16 | tr -d '\n')
 VAULT_PASSWORD=$(openssl rand -base64 24 | tr -d '\n')
 VHOST_PORT=5050
-VHOST_HOST="0.0.0.0"
+VHOST_HOST="127.0.0.1"
 PYTHON_ENV="${INSTALL_DIR}/venv"
 DIFFICULTY=4
+CREDENTIALS_FILE="${INSTALL_DIR}/.vault_credentials"
 
 # ── Colours ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -37,46 +42,48 @@ note()  { echo -e "${BLUE}[NOTE]${NC}  $*"; }
 
 # ── Pre-flight ───────────────────────────────────────────────────────────────
 echo ""
-echo -e "${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}╔════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BOLD}║   Local Blockchain File Vault — Installer                   ║${NC}"
-echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
+echo -e "${BOLD}╚════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 info "Install directory  : ${INSTALL_DIR}"
 info "MySQL database     : ${MYSQL_DB}"
-info "Web server         : http://localhost:${VHOST_PORT}"
+info "Web server         : http://${VHOST_HOST}:${VHOST_PORT}"
 info "Difficulty (PoW)   : ${DIFFICULTY} leading zeros"
 echo ""
-note "Generated credentials (SAVE THESE — especially the Vault Password):"
+note "⚠️  Generated credentials (SAVE THESE — especially the Vault Password):"
 echo ""
 echo "  🔑 MySQL root password : ${MYSQL_ROOT_PASS}"
 echo "  🔑 MySQL app password  : ${MYSQL_PASS}"
 echo "  🔑 Vault encryption    : ${VAULT_PASSWORD}"
+echo ""
+warn "These will be saved to: ${CREDENTIALS_FILE} (mode 600)"
 echo ""
 read -rp "Press ENTER to continue or Ctrl-C to abort..." _
 
 # ============================================================================
 #  1. SYSTEM PACKAGES
 # ============================================================================
-info "Step 1/6: Installing system packages..."
+info "Step 1/7: Installing system packages..."
 apt-get update -qq
 apt-get install -y -qq \
     python3 python3-pip python3-venv python3-dev \
     default-mysql-server default-mysql-client \
     libmysqlclient-dev \
-    curl git build-essential \
+    curl git build-essential logrotate \
     > /dev/null 2>&1
 
 # ============================================================================
-#  2. DIRECTORY TREE
+#  2. DIRECTORY TREE & PERMISSIONS
 # ============================================================================
-info "Step 2/6: Creating directory tree..."
+info "Step 2/7: Creating directory tree..."
 mkdir -p "${INSTALL_DIR}"/{blockchain,web/{templates,static},config,data/uploads,data/encrypted_store,logs}
 mkdir -p "${INSTALL_DIR}/data/encrypted_store"
 
 # ============================================================================
 #  3. PYTHON VENV & DEPENDENCIES
 # ============================================================================
-info "Step 3/6: Setting up Python environment..."
+info "Step 3/7: Setting up Python environment..."
 python3 -m venv "${PYTHON_ENV}"
 # shellcheck disable=SC1090
 source "${PYTHON_ENV}/bin/activate"
@@ -89,7 +96,7 @@ pip install -q \
 # ============================================================================
 #  4. MYSQL CONFIGURATION
 # ============================================================================
-info "Step 4/6: Configuring MySQL..."
+info "Step 4/7: Configuring MySQL..."
 systemctl start mysql 2>/dev/null || service mysql start 2>/dev/null || true
 sleep 2
 
@@ -141,7 +148,7 @@ info "MySQL database '${MYSQL_DB}' is ready."
 # ============================================================================
 #  5. WRITE ALL SOURCE FILES
 # ============================================================================
-info "Step 5/6: Writing application source files..."
+info "Step 5/7: Writing application source files..."
 
 # ── 5a. blockchain/__init__.py ───────────────────────────────────────────────
 cat > "${INSTALL_DIR}/blockchain/__init__.py" << 'PYEOF'
@@ -250,11 +257,13 @@ cat > "${INSTALL_DIR}/blockchain/core.py" << 'PYEOF'
 """
 Core blockchain data structures and Proof-of-Work consensus.
 """
+import os
 import hashlib
 import json
 import time
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
+from blockchain.encryption import SALT_SIZE
 
 
 class Block:
@@ -303,6 +312,11 @@ class Block:
             "nonce":         self.nonce,
         }, sort_keys=True)
         return hashlib.sha256(block_string.encode()).hexdigest()
+
+
+def sha256_hex(data: bytes) -> str:
+    """Return hexadecimal SHA-256 digest."""
+    return hashlib.sha256(data).hexdigest()
 
 
 class Blockchain:
@@ -366,7 +380,6 @@ class Blockchain:
         )
         genesis.block_hash = genesis.compute_hash()
         self._persist(genesis)
-        info("Genesis block created.")
 
     # ── Proof-of-Work mining ───────────────────────────────────────────
     def mine(self, file_name: str, file_mime: str, raw_data: bytes,
@@ -489,10 +502,6 @@ class Blockchain:
             block_hash      = row[9],
             encrypted_path  = row[10] if row[10] else "",
         )
-
-
-# Need os import
-import os
 PYEOF
 
 # ── 5d. blockchain/database.py ──────────────────────────────────────────────
@@ -641,7 +650,7 @@ SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", "change-me-in-production")
 MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50 MB max upload
 PYEOF
 
-# ── 5g. web/__init__.py ─────────────────────────────────────────────────────
+# ── 5g. web/__init__.py ──────────────────────────────────────────────────────
 cat > "${INSTALL_DIR}/web/__init__.py" << 'PYEOF'
 # Web package
 PYEOF
@@ -655,6 +664,7 @@ RESTful API + Server-rendered templates for the immutable file vault.
 import os
 import sys
 import json
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -664,7 +674,6 @@ from flask import (
 )
 from werkzeug.utils import secure_filename
 from io import BytesIO
-from datetime import datetime
 
 from blockchain.core import Blockchain, Block, sha256_hex
 from blockchain.database import DatabaseBackend
@@ -681,6 +690,21 @@ app = Flask(__name__)
 app.secret_key = SECRET_KEY
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# ── Template filters ─────────────────────────────────────────────────────────
+@app.template_filter('format_bytes')
+def format_bytes(size: int) -> str:
+    """Format bytes into human-readable size."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024.0:
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} TB"
+
+@app.context_processor
+def inject_now():
+    """Inject current year and now_year for templates."""
+    return {'now_year': datetime.now().year}
 
 # ── Database & Blockchain initialization ─────────────────────────────────────
 db   = DatabaseBackend(MYSQL_CONFIG)
@@ -699,9 +723,9 @@ def allowed_file(name: str) -> bool:
     return "." in name and name.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  Web Routes (Server-Rendered)
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/")
 def index():
@@ -712,8 +736,8 @@ def index():
     )
     blocks = [
         {
-            "index":      r[1], "file_name": r[2], "file_mime": r[3],
-            "file_size":  r[4], "block_hash": r[5], "timestamp": str(r[6])[:19],
+            "index":      r[0], "file_name": r[1], "file_mime": r[2],
+            "file_size":  r[3], "block_hash": r[4], "timestamp": str(r[5])[:19],
         }
         for r in rows
     ]
@@ -738,25 +762,13 @@ def upload():
 
     raw_data = f.read()
     mime     = f.content_type or "application/octet-stream"
-    result   = vault.store_file(
-        file_path=None,  # we write manually below
-        metadata={"upload_time": datetime.now().isoformat(), "mime": mime},
-    )
 
-    # Write temp file then store
-    temp = os.path.join(UPLOAD_DIR, secure_filename(f.filename))
-    with open(temp, "wb") as out:
-        out.write(raw_data)
-    # Re-store properly (the above already mined; just clean up)
-    # Actually, let's use the core mine directly for correctness:
     block = chain.mine(
         file_name=secure_filename(f.filename),
         file_mime=mime,
         raw_data=raw_data,
         upload_dir=ENCRYPTED_DIR,
     )
-    if os.path.exists(temp):
-        os.remove(temp)
 
     flash(f"Block #{block.index} mined — {block.block_hash[:16]}…", "success")
     return redirect(url_for("index"))
@@ -797,9 +809,9 @@ def verify():
     return render_template("verify.html", errors=errors, valid=len(errors) == 0)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  REST API Endpoints
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/api/chain")
 def api_chain():
@@ -842,17 +854,48 @@ def api_block(idx: int):
     return jsonify(d)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+@app.route("/health")
+def health_check():
+    """Health check endpoint for systemd and load balancers."""
+    try:
+        errors = chain.verify_chain()
+        return jsonify({
+            "status": "ok",
+            "chain_valid": len(errors) == 0,
+            "blocks": chain.length(),
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+        }), 500
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Error Handlers
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.errorhandler(404)
+def not_found(error):
+    return render_template("404.html", error=error), 404
+
+
+@app.errorhandler(500)
+def server_error(error):
+    return render_template("500.html", error=error), 500
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Run
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     print(f"\n  🚀 BlockVault starting on {WEB_HOST}:{WEB_PORT}")
     print(f"  🔐 Vault password: {ENCRYPTION_PASSWORD[:8]}...")
-    print(f"  🗄️  MySQL database: {MYSQL_DB}\n")
+    print(f"  🗄️  MySQL database: blockchain_vault\n")
     app.run(host=WEB_HOST, port=WEB_PORT, debug=False)
 PYEOF
 
-# ── 5i. web/templates/base.html ────────────────────────────────────────────
+# ── 5i. web/templates/base.html ──────────────────────────────────────────────
 cat > "${INSTALL_DIR}/web/templates/base.html" << 'HTMLEOF'
 <!DOCTYPE html>
 <html lang="en">
@@ -897,7 +940,7 @@ cat > "${INSTALL_DIR}/web/templates/base.html" << 'HTMLEOF'
 </html>
 HTMLEOF
 
-# ── 5j. web/templates/index.html ───────────────────────────────────────────
+# ── 5j. web/templates/index.html ─────────────────────────────────────────────
 cat > "${INSTALL_DIR}/web/templates/index.html" << 'HTMLEOF'
 {% extends "base.html" %}
 {% block title %}BlockVault — Dashboard{% endblock %}
@@ -917,7 +960,7 @@ cat > "${INSTALL_DIR}/web/templates/index.html" << 'HTMLEOF'
     <p>Chain Status</p>
   </div>
   <div class="stat-card">
-    <h3>{{ "{:,}".format(blocks|map(attribute='file_size')|list|sum(default=0)) }}</h3>
+    <h3>{{ (blocks|map(attribute='file_size')|list|sum(default=0))|format_bytes }}</h3>
     <p>Total Bytes Stored</p>
   </div>
 </div>
@@ -941,16 +984,15 @@ cat > "${INSTALL_DIR}/web/templates/index.html" << 'HTMLEOF'
 <div class="table-wrap">
 <table>
   <thead>
-    <tr><th>#</th><th>File</th><th>Size</th><th>Timestamp</th><th>Nonce</th><th>Block Hash</th><th></th></tr>
+    <tr><th>#</th><th>File</th><th>Size</th><th>Timestamp</th><th>Block Hash</th><th></th></tr>
   </thead>
   <tbody>
     {% for b in blocks %}
     <tr>
       <td class="mono">{{ b.index }}</td>
       <td>{{ b.file_name }}</td>
-      <td>{{ format_bytes(b.file_size) }}</td>
+      <td>{{ b.file_size|format_bytes }}</td>
       <td class="meta">{{ b.timestamp[:19] }}</td>
-      <td class="mono">{{ b.nonce }}</td>
       <td class="hash mono">{{ b.block_hash[:24] }}…</td>
       <td>
         <a href="/block/{{ b.index }}">👁 View</a> ·
@@ -989,7 +1031,7 @@ dz.addEventListener('click',()=>document.getElementById('fileInput').click());
 {% endblock %}
 HTMLEOF
 
-# ── 5k. web/templates/block.html ────────────────────────────────────────────
+# ── 5k. web/templates/block.html ─────────────────────────────────────────────
 cat > "${INSTALL_DIR}/web/templates/block.html" << 'HTMLEOF'
 {% extends "base.html" %}
 {% block title %}Block #{{ block.index }} — BlockVault{% endblock %}
@@ -1002,7 +1044,7 @@ cat > "${INSTALL_DIR}/web/templates/block.html" << 'HTMLEOF'
   <tr><td class="detail-label">File Name</td><td>{{ block.file_name }}</td></tr>
   <tr><td class="detail-label">MIME Type</td><td>{{ block.file_mime }}</td></tr>
   <tr><td class="detail-label">Original SHA-256</td><td class="hash mono">{{ block.original_hash }}</td></tr>
-  <tr><td class="detail-label">File Size</td><td>{{ format_bytes(block.file_size) }}</td></tr>
+  <tr><td class="detail-label">File Size</td><td>{{ block.file_size|format_bytes }}</td></tr>
   <tr><td class="detail-label">Nonce</td><td>{{ "{:,}".format(block.nonce) }}</td></tr>
   <tr><td class="detail-label">Encrypted Storage</td><td class="mono">{{ block.encrypted_path }}</td></tr>
 </table>
@@ -1020,7 +1062,7 @@ cat > "${INSTALL_DIR}/web/templates/block.html" << 'HTMLEOF'
 {% endblock %}
 HTMLEOF
 
-# ── 5l. web/templates/verify.html ──────────────────────────────────────────
+# ── 5l. web/templates/verify.html ────────────────────────────────────────────
 cat > "${INSTALL_DIR}/web/templates/verify.html" << 'HTMLEOF'
 {% extends "base.html" %}
 {% block title %}Chain Verification — BlockVault{% endblock %}
@@ -1054,7 +1096,29 @@ cat > "${INSTALL_DIR}/web/templates/verify.html" << 'HTMLEOF'
 {% endblock %}
 HTMLEOF
 
-# ── 5m. web/static/style.css ───────────────────────────────────────────────
+# ── 5m. web/templates/404.html ───────────────────────────────────────────────
+cat > "${INSTALL_DIR}/web/templates/404.html" << 'HTMLEOF'
+{% extends "base.html" %}
+{% block title %}404 Not Found{% endblock %}
+{% block body %}
+<h2>404 — Page Not Found</h2>
+<p>The requested resource could not be found on this server.</p>
+<a href="/" class="btn-secondary">← Return to Dashboard</a>
+{% endblock %}
+HTMLEOF
+
+# ── 5n. web/templates/500.html ───────────────────────────────────────────────
+cat > "${INSTALL_DIR}/web/templates/500.html" << 'HTMLEOF'
+{% extends "base.html" %}
+{% block title %}500 Server Error{% endblock %}
+{% block body %}
+<h2>500 — Server Error</h2>
+<p>An unexpected error occurred. Please try again later.</p>
+<a href="/" class="btn-secondary">← Return to Dashboard</a>
+{% endblock %}
+HTMLEOF
+
+# ── 5o. web/static/style.css ────────────────────────────────────────────────
 cat > "${INSTALL_DIR}/web/static/style.css" << 'CSSEOF'
 :root {
   --bg:#0f1117; --surface:#1a1d27; --accent:#5b8def;
@@ -1093,7 +1157,6 @@ footer {
   text-align:center; color:var(--muted); font-size:.8rem;
   margin-top:3rem; padding:1.5rem; border-top:1px solid #2a2d3a;
 }
-.now-year::before { content: attr(data-year); }
 
 /* Flash messages */
 .flash {
@@ -1102,6 +1165,20 @@ footer {
 }
 .flash-success { background:rgba(46,204,113,.12); border:1px solid var(--green); }
 .flash-danger  { background:rgba(231,76,60,.12);  border:1px solid var(--red); }
+
+/* Alerts */
+.alert {
+  padding:1rem; border-radius:var(--radius); margin-bottom:1rem;
+  border-left:4px solid;
+}
+.alert-success {
+  background:rgba(46,204,113,.12); border-left-color:var(--green);
+  color:#2ecc71;
+}
+.alert-error {
+  background:rgba(231,76,60,.12); border-left-color:var(--red);
+  color:#e74c3c;
+}
 
 /* Stats */
 .stats-grid {
@@ -1178,14 +1255,11 @@ tr:hover td { background:rgba(91,141,239,.04); }
 .error-list li::before { content:"⚠"; position:absolute; left:0; }
 CSSEOF
 
-# ── 5n. web/static/script.js ────────────────────────────────────────────────
+# ── 5p. web/static/script.js ────────────────────────────────────────────────
 cat > "${INSTALL_DIR}/web/static/script.js" << 'JSEOF'
 document.addEventListener('DOMContentLoaded', function() {
-  // Auto-set footer year
   var el = document.querySelector('.now-year');
   if (el) el.textContent = new Date().getFullYear();
-
-  // Chain validity check
   checkChainValidity();
 });
 
@@ -1202,27 +1276,10 @@ function checkChainValidity() {
     .catch(function(e){ console.error('Verify check failed:', e); });
 }
 
-function verifyChain() {
-  checkChainValidity();
-  alert('Chain verification complete.');
-}
-
-// Format bytes helper (used by server-side template filter as well)
-function formatBytes(b) {
-  if (b === 0) return '0 B';
-  var k = 1024, u = ['B','KB','MB','GB'];
-  var i = Math.floor(Math.log(b) / Math.log(k));
-  return (b / Math.pow(k, i)).toFixed(1) + ' ' + u[i];
-}
-
-// Periodic chain check (every 60 seconds)
 setInterval(checkChainValidity, 60000);
 JSEOF
 
-# ── 5o. web/templates/layout.html (shared layout with Jinja2 filters) ────
-# Note: We add custom filters via app.py. The base.html above serves as layout.
-
-# ── 5p. requirements.txt ───────────────────────────────────────────────────
+# ── 5q. requirements.txt ────────────────────────────────────────────────────
 cat > "${INSTALL_DIR}/requirements.txt" << 'PYEOF'
 flask>=3.0
 flask-cors>=4.0
@@ -1234,7 +1291,7 @@ python-dotenv>=1.0
 bcrypt>=4.0
 PYEOF
 
-# ── 5q. run.sh — Convenience launcher ──────────────────────────────────────
+# ── 5r. run.sh — Convenience launcher ──────────────────────────────────────
 cat > "${INSTALL_DIR}/run.sh" << 'BASHEOF'
 #!/usr/bin/env bash
 SCRIPTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -1244,32 +1301,49 @@ echo ""
 echo "  ╔══════════════════════════════════════════════════╗"
 echo "  ║         🔗 BlockVault Starting...               ║"
 echo "  ╠══════════════════════════════════════════════════╣"
-echo "  ║  URL:    http://localhost:${WEB_PORT:-5050}                  ║"
-echo "  ║  Port:   ${WEB_PORT:-5050}                                    ║"
+echo "  ║  URL:    http://localhost:5050                  ║"
+echo "  ║  Port:   5050                                    ║"
 echo "  ╚══════════════════════════════════════════════════╝"
 echo ""
 exec python web/app.py
 BASHEOF
 chmod +x "${INSTALL_DIR}/run.sh"
 
-# ── 5r. systemd service ────────────────────────────────────────────────────
+# ── 5s. systemd service ────────────────────────────────────────────────────
 cat > /tmp/blockvault.service << SVCEOF
 [Unit]
 Description=BlockVault — Local Blockchain File Vault
-After=network.target mysql.service
+After=network-online.target mysql.service
 Wants=mysql.service
+Documentation=http://localhost:5050
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=${INSTALL_DIR}
-Environment="VAULT_PASSWORD=${VAULT_PASSWORD}"
+EnvironmentFile=${CREDENTIALS_FILE}
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=${PYTHON_ENV}/bin/python ${INSTALL_DIR}/web/app.py
+
 Restart=on-failure
 RestartSec=5
-StandardOutput=append:${INSTALL_DIR}/logs/server.log
-StandardError=append:${INSTALL_DIR}/logs/server.log
+StartLimitInterval=300
+StartLimitBurst=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=blockvault
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=${INSTALL_DIR}
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -1278,53 +1352,104 @@ SVCEOF
 cp /tmp/blockvault.service /etc/systemd/system/blockvault.service
 chmod 644 /etc/systemd/system/blockvault.service
 
-# ============================================================================
-#  6. FINALIZE AND START
-# ============================================================================
-info "Step 6/6: Finalizing..."
+# ── 5t. logrotate configuration ──────────────────────────────────────────────
+cat > /etc/logrotate.d/blockvault << 'ROTEOF'
+/opt/blockchain_vault/logs/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    create 0640 root root
+    sharedscripts
+    postrotate
+        systemctl reload-or-restart blockvault > /dev/null 2>&1 || true
+    endscript
+}
+ROTEOF
 
-# Start MySQL
+# ── 5u. uninstall script ────────────────────────────────────────────────────
+cat > "${INSTALL_DIR}/UNINSTALL.sh" << 'UNINSTALLEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+INSTALL_DIR="/opt/blockchain_vault"
+RED='\033[0;31m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
+
+echo -e "${BOLD}⚠️  BlockVault Uninstall${NC}"
+echo ""
+read -rp "Are you sure? [y/N] " -n 1 reply
+echo ""
+if [[ ! $reply =~ ^[Yy]$ ]]; then
+    echo "Aborted."
+    exit 0
+fi
+
+systemctl stop blockvault 2>/dev/null || true
+systemctl disable blockvault 2>/dev/null || true
+rm -f /etc/systemd/system/blockvault.service
+rm -f /etc/logrotate.d/blockvault
+systemctl daemon-reload
+
+echo ""
+echo -e "${YELLOW}✅ Uninstall complete. Data preserved at: ${INSTALL_DIR}${NC}"
+UNINSTALLEOF
+chmod +x "${INSTALL_DIR}/UNINSTALL.sh"
+
+# ============================================================================
+#  6. SAVE CREDENTIALS SECURELY
+# ============================================================================
+info "Step 6/7: Saving credentials securely..."
+cat > "${CREDENTIALS_FILE}" << CREDSEOF
+# BlockVault Credentials — KEEP THIS SECURE!
+# Generated on $(date)
+
+export MYSQL_ROOT_PASS="${MYSQL_ROOT_PASS}"
+export MYSQL_USER="${MYSQL_USER}"
+export MYSQL_PASS="${MYSQL_PASS}"
+export VAULT_PASSWORD="${VAULT_PASSWORD}"
+CREDSEOF
+
+chmod 600 "${CREDENTIALS_FILE}"
+info "Credentials saved to: ${CREDENTIALS_FILE} (mode 600)"
+
+# ============================================================================
+#  7. FINALIZE AND VERIFY
+# ============================================================================
+info "Step 7/7: Finalizing and verifying installation..."
+
 systemctl enable --now mysql 2>/dev/null || service mysql enable --now 2>/dev/null || true
 sleep 1
 
-# Verify Python imports work
 "${PYTHON_ENV}"/bin/python -c "
 import sys
 sys.path.insert(0, '${INSTALL_DIR}')
 from blockchain.core import Blockchain, Block, sha256_hex
-from blockchain.encryption import EncryptionManager, sha256_hex as h2
+from blockchain.encryption import EncryptionManager, SALT_SIZE
 from blockchain.database import DatabaseBackend
 from blockchain.storage import FileVault
 print('  ✔ All Python imports OK')
-"
+" || exit 1
 
 systemctl daemon-reload 2>/dev/null || true
 
 echo ""
-echo -e "${BOLD}╔══════════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}╔════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BOLD}█${NC}                                                                        ${BOLD}█${NC}"
 echo -e "${BOLD}█${NC}   ${GREEN}✅ BlockVault installed successfully!${NC}                                       ${BOLD}█${NC}"
 echo -e "${BOLD}█${NC}                                                                        ${BOLD}█${NC}"
-echo -e "${BOLD}█${NC}   Installation directory : ${INSTALL_DIR}              ${BOLD}█${NC}"
-echo -e "${BOLD}█${NC}   Web server port        : ${VHOST_PORT}                                     ${BOLD}█${NC}"
-echo -e "${BOLD}█${NC}   MySQL database         : ${MYSQL_DB}                                       ${BOLD}█${NC}"
-echo -e "${BOLD}█${NC}   PoW difficulty         : ${DIFFICULTY} zeros                                    ${BOLD}█${NC}"
-echo -e "${BOLD}█${NC}   Encryption             : AES-256-CBC (PBKDF2 600k iter)               ${BOLD}█${NC}"
+echo -e "${BOLD}█${NC}   Install: ${INSTALL_DIR}                                  ${BOLD}█${NC}"
+echo -e "${BOLD}█${NC}   Web:     http://${VHOST_HOST}:${VHOST_PORT}                                          ${BOLD}█${NC}"
+echo -e "${BOLD}█${NC}   Creds:   ${CREDENTIALS_FILE} (mode 600)         ${BOLD}█${NC}"
 echo -e "${BOLD}█${NC}                                                                        ${BOLD}█${NC}"
-echo -e "${BOLD}█${NC}   🔑 Vault Password (save this!):${NC}"
-echo -e "${BOLD}█${NC}      ${VAULT_PASSWORD}         ${BOLD}█${NC}"
-echo -e "${BOLD}█${NC}                                                                        ${BOLD}█${NC}"
-echo -e "${BOLD}█${NC}   Quick start (manual):                                                ${BOLD}█${NC}"
-echo -e "${BOLD}█${NC}     source ${INSTALL_DIR}/venv/bin/activate                                  ${BOLD}█${NC}"
-echo -e "${BOLD}█${NC}     cd ${INSTALL_DIR} && bash run.sh                                       ${BOLD}█${NC}"
-echo -e "${BOLD}█${NC}                                                                        ${BOLD}█${NC}"
-echo -e "${BOLD}█${NC}   …or use systemd service:                                             ${BOLD}█${NC}"
+echo -e "${BOLD}█${NC}   ${GREEN}Quick Start:${NC}                                                           ${BOLD}█${NC}"
 echo -e "${BOLD}█${NC}     systemctl start blockvault                                          ${BOLD}█${NC}"
-echo -e "${BOLD}█${NC}     systemctl enable blockvault                                         ${BOLD}█${NC}"
 echo -e "${BOLD}█${NC}     systemctl status blockvault                                         ${BOLD}█${NC}"
+echo -e "${BOLD}█${NC}     curl http://${VHOST_HOST}:${VHOST_PORT}/health                                     ${BOLD}█${NC}"
 echo -e "${BOLD}█${NC}                                                                        ${BOLD}█${NC}"
-echo -e "${BOLD}█${NC}   Generated credentials:${NC}"
-echo -e "${BOLD}█${NC}     MySQL root: ${MYSQL_ROOT_PASS}                              ${BOLD}█${NC}"
-echo -e "${BOLD}█${NC}     MySQL app:  ${MYSQL_PASS}                               ${BOLD}█${NC}"
+echo -e "${BOLD}█${NC}   ${GREEN}Important:${NC}                                                            ${BOLD}█${NC}"
+echo -e "${BOLD}█${NC}     • Backup .vault_credentials immediately                            ${BOLD}█${NC}"
+echo -e "${BOLD}█${NC}     • Review BACKUP_GUIDE.md for backup strategy                      ${BOLD}█${NC}"
 echo -e "${BOLD}█${NC}                                                                        ${BOLD}█${NC}"
-echo -e "${BOLD}╚══════════════════════════════════════════════════════════════════╝${NC}"
+echo -e "${BOLD}╚════════════════════════════════════════════════════════════╝${NC}"
+echo ""
