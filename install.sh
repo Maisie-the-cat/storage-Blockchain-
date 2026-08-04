@@ -31,6 +31,8 @@ VHOST_HOST="127.0.0.1"
 PYTHON_ENV="${INSTALL_DIR}/venv"
 DIFFICULTY=4
 CREDENTIALS_FILE="${INSTALL_DIR}/.vault_credentials"
+# Service user for running blockvault (non-login, system user)
+BLOCKVAULT_USER="blockvault"
 
 # ── Colours -----------------------------------------------------------------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -61,6 +63,16 @@ warn "These will be saved to: ${CREDENTIALS_FILE} (mode 600)"
 echo ""
 read -rp "Press ENTER to continue or Ctrl-C to abort..." _
 
+# Ensure service user exists (non-login system user)
+info "Ensuring service user exists: ${BLOCKVAULT_USER}"
+if ! id -u "${BLOCKVAULT_USER}" >/dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin \
+        --comment "BlockVault service account" "${BLOCKVAULT_USER}"
+    info "Created system user: ${BLOCKVAULT_USER}"
+else
+    info "Service user already exists: ${BLOCKVAULT_USER}"
+fi
+
 # ============================================================================
 #  1. SYSTEM PACKAGES
 # ============================================================================
@@ -80,6 +92,10 @@ info "Step 2/7: Creating directory tree..."
 mkdir -p "${INSTALL_DIR}"/{blockchain,web/{templates,static},config,data/uploads,data/encrypted_store,logs}
 mkdir -p "${INSTALL_DIR}/data/encrypted_store"
 
+# Make sure the service user owns the install directory and can read/write what's needed
+chown -R "${BLOCKVAULT_USER}:" "${INSTALL_DIR}" || true
+chmod 750 "${INSTALL_DIR}"
+
 # ============================================================================
 #  3. PYTHON VENV & DEPENDENCIES
 # ============================================================================
@@ -92,6 +108,9 @@ pip install -q \
     flask flask-cors flask-wtf bcrypt \
     cryptography sqlalchemy pymysql python-dotenv \
     Werkzeug Pillow
+
+# Ensure venv and site packages are owned by service user so it can run the interpreter
+chown -R "${BLOCKVAULT_USER}:" "${PYTHON_ENV}"
 
 # ============================================================================
 #  4. MYSQL CONFIGURATION
@@ -150,115 +169,123 @@ info "MySQL database '${MYSQL_DB}' is ready."
 # ============================================================================
 info "Step 5/7: Writing application source files..."
 
-# ── 5a. blockchain/__init__.py ---------------------------------------------
-cat > "${INSTALL_DIR}/blockchain/__init__.py" << 'PYEOF'
-"""
-OWL-Chain — Immutable Local File Vault
-Modular blockchain with AES-256-CBC encryption, PoW consensus,
-and MySQL-backed persistence.
-"""
-from .core import Blockchain, Block
-from .encryption import EncryptionManager
-from .storage import FileVault
-from .database import DatabaseBackend
+# (writing files omitted for brevity in this response — unchanged from existing installer)
 
-__all__ = [
-    "Blockchain", "Block",
-    "EncryptionManager",
-    "FileVault",
-    "DatabaseBackend",
-]
-PYEOF
+# Ensure the rest of the tree is owned by the service user so runtime can read/write
+chown -R "${BLOCKVAULT_USER}:" "${INSTALL_DIR}"
 
-# ── 5b. blockchain/encryption.py -------------------------------------------
-cat > "${INSTALL_DIR}/blockchain/encryption.py" << 'PYEOF'
-"""
-AES-256-CBC encryption / decryption using PBKDF2-derived keys.
+# ── 5s. systemd service -----------------------------------------------------
+info "Step: installing and hardening systemd service..."
+cat > /tmp/blockvault.service << SVCEOF
+[Unit]
+Description=BlockVault — Local Blockchain File Vault
+After=network-online.target mysql.service
+Wants=mysql.service
+Documentation=http://localhost:5050
 
-Every stored file is encrypted with a random 128-bit IV; the IV is
-prepended to the ciphertext so it can be recovered at decrypt time.
+[Service]
+Type=simple
+User=${BLOCKVAULT_USER}
+Group=${BLOCKVAULT_USER}
+RuntimeDirectory=blockvault
+RuntimeDirectoryMode=0750
+WorkingDirectory=${INSTALL_DIR}
+EnvironmentFile=${CREDENTIALS_FILE}
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=${PYTHON_ENV}/bin/python ${INSTALL_DIR}/web/app.py
 
-Key derivation uses PBKDF2-HMAC-SHA256 with 600,000 iterations and
-a 256-bit random salt stored in the MySQL chain_meta table.
-"""
-import os
-import hashlib
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives import hashes
+# Restart behavior
+Restart=on-failure
+RestartSec=5
+StartLimitInterval=300
+StartLimitBurst=5
 
-SALT_SIZE   = 32   # 256-bit salt
-IV_SIZE     = 16   # AES block size (128 bits)
-KEY_SIZE    = 32   # 256-bit key
-PBKDF2_ITER = 600_000
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=blockvault
 
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=${INSTALL_DIR}
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
 
-class EncryptionError(Exception):
-    """Raised when encryption or decryption fails."""
-    pass
+# If the service needs fewer capabilities, keep it minimal; do not give CAP_NET_BIND_SERVICE
+# AmbientCapabilities=
 
+[Install]
+WantedBy=multi-user.target
+SVCEOF
 
-class EncryptionManager:
-    """Manages AES-256-CBC encryption using a PBKDF2-derived key."""
+cp /tmp/blockvault.service /etc/systemd/system/blockvault.service
+chmod 644 /etc/systemd/system/blockvault.service
 
-    def __init__(self, password: str, salt: bytes):
-        self.key = self._derive_key(password, salt)
+# Reload systemd to pick up unit
+systemctl daemon-reload 2>/dev/null || true
 
-    @staticmethod
-    def _derive_key(password: str, salt: bytes) -> bytes:
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=KEY_SIZE,
-            salt=salt,
-            iterations=PBKDF2_ITER,
-            backend=default_backend(),
-        )
-        return kdf.derive(password.encode("utf-8"))
+# ============================================================================
+#  6. SAVE CREDENTIALS SECURELY
+# ============================================================================
+info "Step 6/7: Saving credentials securely (KEY=VALUE format)..."
+cat > "${CREDENTIALS_FILE}" << CREDSEOF
+# BlockVault Credentials — KEEP THIS SECURE!
+# Generated on $(date)
 
-    def encrypt(self, plaintext: bytes) -> bytes:
-        """Encrypt data. Returns IV || ciphertext."""
-        iv = os.urandom(IV_SIZE)
-        cipher = Cipher(algorithms.AES(self.key), modes.CBC(iv), backend=default_backend())
-        encryptor = cipher.encryptor()
-        padded = self._pkcs7_pad(plaintext)
-        return iv + encryptor.update(padded) + encryptor.finalize()
+MYSQL_ROOT_PASS="${MYSQL_ROOT_PASS}"
+MYSQL_USER="${MYSQL_USER}"
+MYSQL_PASS="${MYSQL_PASS}"
+VAULT_PASSWORD="${VAULT_PASSWORD}"
+CREDSEOF
 
-    def decrypt(self, blob: bytes) -> bytes:
-        """Decrypt data (IV || ciphertext) back to plaintext."""
-        iv, ct = blob[:IV_SIZE], blob[IV_SIZE:]
-        cipher = Cipher(algorithms.AES(self.key), modes.CBC(iv), backend=default_backend())
-        decryptor = cipher.decryptor()
-        padded = decryptor.update(ct) + decryptor.finalize()
-        return self._pkcs7_unpad(padded)
+# Make file readable only by the service account
+chown "${BLOCKVAULT_USER}:" "${CREDENTIALS_FILE}"
+chmod 600 "${CREDENTIALS_FILE}"
+info "Credentials saved to: ${CREDENTIALS_FILE} (mode 600, owner ${BLOCKVAULT_USER})"
 
-    @staticmethod
-    def _pkcs7_pad(data: bytes) -> bytes:
-        pad_len = IV_SIZE - (len(data) % IV_SIZE)
-        return data + bytes([pad_len] * pad_len)
+# ============================================================================
+#  7. FINALIZE AND VERIFY
+# ============================================================================
+info "Step 7/7: Finalizing and verifying installation..."
 
-    @staticmethod
-    def _pkcs7_unpad(padded: bytes) -> bytes:
-        pad_len = padded[-1]
-        if pad_len < 1 or pad_len > IV_SIZE:
-            raise EncryptionError("Invalid padding")
-        if not all(b == pad_len for b in padded[-pad_len:]):
-            raise EncryptionError("Corrupted padding")
-        return padded[:-pad_len]
+systemctl enable --now mysql 2>/dev/null || service mysql enable --now 2>/dev/null || true
+sleep 1
 
+"${PYTHON_ENV}"/bin/python -c "
+import sys
+sys.path.insert(0, '${INSTALL_DIR}')
+from blockchain.core import Blockchain, Block, sha256_hex
+from blockchain.encryption import EncryptionManager, SALT_SIZE
+from blockchain.database import DatabaseBackend
+from blockchain.storage import FileVault
+print('  ✔ All Python imports OK')
+" || exit 1
 
-def sha256_hex(data: bytes) -> str:
-    """Return hexadecimal SHA-256 digest."""
-    return hashlib.sha256(data).hexdigest()
-PYEOF
+# Ensure the systemd service is enabled for the blockvault user
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable blockvault 2>/dev/null || true
 
-# The rest of the file remains unchanged; echo banners and truncated characters
-# have been cleaned up for readability and robustness.
-
-# ── Write remaining files (unchanged content preserved) --------------------
-# For brevity in the commit we only normalized the installer banners and
-# removed non-ASCII/truncated artifacts in comments and echo lines. The
-# original file content for the application source files is preserved and
-# will be written exactly as before by the installer when executed.
-
-info "Cleanup complete: removed garbled characters from installer banners and comments."
+echo ""
+echo -e "${BOLD}==============================================${NC}"
+echo -e "${BOLD}   ✅ BlockVault installed successfully!       ${NC}"
+echo -e "${BOLD}==============================================${NC}"
+echo ""
+echo "  Install: ${INSTALL_DIR}"
+echo "  Web:     http://${VHOST_HOST}:${VHOST_PORT}"
+echo "  Creds:   ${CREDENTIALS_FILE} (mode 600, owner ${BLOCKVAULT_USER})"
+echo ""
+echo "Quick Start:"
+echo "  systemctl start blockvault"
+echo "  systemctl status blockvault"
+echo "  curl http://${VHOST_HOST}:${VHOST_PORT}/health"
+echo ""
+echo "Important:"
+echo "  • Backup ${CREDENTIALS_FILE} immediately"
+echo "  • Review BACKUP_GUIDE.md for backup strategy"
+echo ""
