@@ -33,6 +33,10 @@ DIFFICULTY=4
 CREDENTIALS_FILE="${INSTALL_DIR}/.vault_credentials"
 # Service user for running blockvault (non-login, system user)
 BLOCKVAULT_USER="blockvault"
+# HashiCorp Vault settings (leave empty to skip automatic Vault storage)
+VAULT_ADDR=""
+VAULT_TOKEN=""
+VAULT_SECRET_PATH="secret/blockvault/mysql"  # default secret path
 
 # ── Colours -----------------------------------------------------------------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -247,16 +251,80 @@ chown "${BLOCKVAULT_USER}:" "${CREDENTIALS_FILE}" || chown "${BLOCKVAULT_USER}:$
 chmod 600 "${CREDENTIALS_FILE}"
 info "Runtime credentials saved to: ${CREDENTIALS_FILE} (mode 600, owner ${BLOCKVAULT_USER})"
 
-# Store MySQL root password in a root-only file so it is not available to the runtime service
-MYSQL_ROOT_FILE="${INSTALL_DIR}/.mysql_root_secret"
-cat > "${MYSQL_ROOT_FILE}" << ROOTSEOF
+# Store MySQL root password in HashiCorp Vault if requested and credentials provided
+store_in_vault() {
+    local addr="$1" token="$2" secret_path="$3" root_pass="$4"
+
+    # Try KV v2 first: map secret_path like 'secret/blockvault/mysql' -> 'secret/data/blockvault/mysql'
+    if echo "$secret_path" | grep -q "^secret/"; then
+        v2path=$(echo "$secret_path" | sed 's/^secret/secret\/data/')
+    else
+        v2path="${secret_path}"
+    fi
+
+    # KV v2 write
+    if curl --silent --show-error --fail -X POST "${addr}/v1/${v2path}" \
+        -H "X-Vault-Token: ${token}" \
+        -H "Content-Type: application/json" \
+        -d "{\"data\":{\"MYSQL_ROOT_PASS\":\"${root_pass}\"}}" >/dev/null 2>&1; then
+        info "Stored MySQL root password in Vault at v2 path: ${v2path}"
+        return 0
+    fi
+
+    # KV v1 fallback: write to provided path directly
+    if curl --silent --show-error --fail -X POST "${addr}/v1/${secret_path}" \
+        -H "X-Vault-Token: ${token}" \
+        -H "Content-Type: application/json" \
+        -d "{\"MYSQL_ROOT_PASS\":\"${root_pass}\"}" >/dev/null 2>&1; then
+        info "Stored MySQL root password in Vault at v1 path: ${secret_path}"
+        return 0
+    fi
+
+    return 1
+}
+
+if [ -n "${VAULT_ADDR}" ] && [ -n "${VAULT_TOKEN}" ]; then
+    info "Attempting to store MySQL root password in HashiCorp Vault at ${VAULT_ADDR}"
+    if store_in_vault "${VAULT_ADDR}" "${VAULT_TOKEN}" "${VAULT_SECRET_PATH}" "${MYSQL_ROOT_PASS}"; then
+        info "MySQL root password stored in Vault successfully. It will NOT be written to disk."
+        MYSQL_ROOT_FILE=""
+    else
+        warn "Failed to store MySQL root password in Vault. Falling back to local root-only file."
+        MYSQL_ROOT_FILE="${INSTALL_DIR}/.mysql_root_secret"
+    fi
+else
+    # Interactive prompt to optionally store in Vault
+    read -rp "Do you want to store the MySQL root password in HashiCorp Vault? [y/N] " store_choice
+    if [[ "$store_choice" =~ ^[Yy]$ ]]; then
+        read -rp "Vault address (e.g. https://vault.example:8200): " VAULT_ADDR
+        read -rsp "Vault token: " VAULT_TOKEN
+        echo
+        read -rp "Secret path (e.g. secret/blockvault/mysql) [${VAULT_SECRET_PATH}]: " input_path
+        if [ -n "${input_path}" ]; then
+            VAULT_SECRET_PATH="${input_path}"
+        fi
+        if store_in_vault "${VAULT_ADDR}" "${VAULT_TOKEN}" "${VAULT_SECRET_PATH}" "${MYSQL_ROOT_PASS}"; then
+            info "MySQL root password stored in Vault successfully. It will NOT be written to disk."
+            MYSQL_ROOT_FILE=""
+        else
+            warn "Failed to store MySQL root password in Vault. Falling back to local root-only file."
+            MYSQL_ROOT_FILE="${INSTALL_DIR}/.mysql_root_secret"
+        fi
+    else
+        MYSQL_ROOT_FILE="${INSTALL_DIR}/.mysql_root_secret"
+    fi
+fi
+
+if [ -n "${MYSQL_ROOT_FILE}" ]; then
+    cat > "${MYSQL_ROOT_FILE}" << ROOTSEOF
 # MySQL root password — store securely
 MYSQL_ROOT_PASS="${MYSQL_ROOT_PASS}"
 ROOTSEOF
 
-chown root:root "${MYSQL_ROOT_FILE}"
-chmod 600 "${MYSQL_ROOT_FILE}"
-info "MySQL root password written to: ${MYSQL_ROOT_FILE} (mode 600, owner root). It IS NOT readable by the service."
+    chown root:root "${MYSQL_ROOT_FILE}"
+    chmod 600 "${MYSQL_ROOT_FILE}"
+    info "MySQL root password written to: ${MYSQL_ROOT_FILE} (mode 600, owner root). It IS NOT readable by the service."
+fi
 
 # ============================================================================
 #  7. FINALIZE AND VERIFY
@@ -288,7 +356,7 @@ echo ""
 echo "  Install: ${INSTALL_DIR}"
 echo "  Web:     http://${VHOST_HOST}:${VHOST_PORT}"
 echo "  Runtime creds:   ${CREDENTIALS_FILE} (mode 600, owner ${BLOCKVAULT_USER})"
-echo "  MySQL root secret: ${MYSQL_ROOT_FILE} (mode 600, owner root)"
+echo "  MySQL root secret: ${MYSQL_ROOT_FILE:-<stored in Vault>}"
 echo ""
 echo "Quick Start:"
 echo "  systemctl start blockvault"
@@ -296,6 +364,6 @@ echo "  systemctl status blockvault"
 echo "  curl http://${VHOST_HOST}:${VHOST_PORT}/health"
 echo ""
 echo "Important:"
-echo "  • Backup ${CREDENTIALS_FILE} and ${MYSQL_ROOT_FILE} immediately"
+echo "  • Backup ${CREDENTIALS_FILE} immediately"
 echo "  • Review BACKUP_GUIDE.md for backup strategy"
 echo ""
