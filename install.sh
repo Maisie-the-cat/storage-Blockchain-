@@ -233,21 +233,30 @@ systemctl daemon-reload 2>/dev/null || true
 # ============================================================================
 #  6. SAVE CREDENTIALS SECURELY
 # ============================================================================
-info "Step 6/7: Saving credentials securely (KEY=VALUE format)..."
+info "Step 6/7: Saving credentials securely (runtime file will not contain MySQL root password)..."
+# Runtime credentials (non-root) — readable by service user only
 cat > "${CREDENTIALS_FILE}" << CREDSEOF
-# BlockVault Credentials — KEEP THIS SECURE!
-# Generated on $(date)
-
-MYSQL_ROOT_PASS="${MYSQL_ROOT_PASS}"
+# BlockVault runtime environment — non-root credentials only
 MYSQL_USER="${MYSQL_USER}"
 MYSQL_PASS="${MYSQL_PASS}"
 VAULT_PASSWORD="${VAULT_PASSWORD}"
 CREDSEOF
 
 # Make file readable only by the service account
-chown "${BLOCKVAULT_USER}:" "${CREDENTIALS_FILE}"
+chown "${BLOCKVAULT_USER}:" "${CREDENTIALS_FILE}" || chown "${BLOCKVAULT_USER}:${BLOCKVAULT_USER}" "${CREDENTIALS_FILE}"
 chmod 600 "${CREDENTIALS_FILE}"
-info "Credentials saved to: ${CREDENTIALS_FILE} (mode 600, owner ${BLOCKVAULT_USER})"
+info "Runtime credentials saved to: ${CREDENTIALS_FILE} (mode 600, owner ${BLOCKVAULT_USER})"
+
+# Store MySQL root password in a root-only file so it is not available to the runtime service
+MYSQL_ROOT_FILE="${INSTALL_DIR}/.mysql_root_secret"
+cat > "${MYSQL_ROOT_FILE}" << ROOTSEOF
+# MySQL root password — store securely
+MYSQL_ROOT_PASS="${MYSQL_ROOT_PASS}"
+ROOTSEOF
+
+chown root:root "${MYSQL_ROOT_FILE}"
+chmod 600 "${MYSQL_ROOT_FILE}"
+info "MySQL root password written to: ${MYSQL_ROOT_FILE} (mode 600, owner root). It IS NOT readable by the service."
 
 # ============================================================================
 #  7. FINALIZE AND VERIFY
@@ -278,7 +287,8 @@ echo -e "${BOLD}==============================================${NC}"
 echo ""
 echo "  Install: ${INSTALL_DIR}"
 echo "  Web:     http://${VHOST_HOST}:${VHOST_PORT}"
-echo "  Creds:   ${CREDENTIALS_FILE} (mode 600, owner ${BLOCKVAULT_USER})"
+echo "  Runtime creds:   ${CREDENTIALS_FILE} (mode 600, owner ${BLOCKVAULT_USER})"
+echo "  MySQL root secret: ${MYSQL_ROOT_FILE} (mode 600, owner root)"
 echo ""
 echo "Quick Start:"
 echo "  systemctl start blockvault"
@@ -286,6 +296,6 @@ echo "  systemctl status blockvault"
 echo "  curl http://${VHOST_HOST}:${VHOST_PORT}/health"
 echo ""
 echo "Important:"
-echo "  • Backup ${CREDENTIALS_FILE} immediately"
+echo "  • Backup ${CREDENTIALS_FILE} and ${MYSQL_ROOT_FILE} immediately"
 echo "  • Review BACKUP_GUIDE.md for backup strategy"
 echo ""
