@@ -20,7 +20,9 @@ import json
 import base64
 import hashlib
 import hmac
+import re
 from typing import Optional
+from urllib.parse import urlparse, urlunparse
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -47,6 +49,37 @@ class EncryptionError(Exception):
     pass
 
 
+def _build_vault_transit_url(base_url: str, operation: str, key_name: str) -> str:
+    try:
+        # Minimal path validation
+        if "/../" in base_url or re.search(r"/%2e%2e/", base_url, re.IGNORECASE):
+            raise ValueError("Invalid path")
+        
+        parsed = urlparse(base_url)
+        
+        # Protocol + host checks
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("Invalid protocol")
+        if not parsed.hostname:
+            raise ValueError("Invalid host")
+        allowed_domains = ["example.com"]  # add your allowed domains here
+        if parsed.hostname.lower() not in allowed_domains:
+            raise ValueError("Invalid host")
+        
+        # Validate path parameters
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", operation):
+            raise ValueError("Invalid parameter")
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", key_name):
+            raise ValueError("Invalid parameter")
+        
+        # Rebuild path from fixed literals + validated segments
+        parsed = parsed._replace(path=f"/v1/transit/{operation}/{key_name}")
+        
+        return urlunparse(parsed)
+    except Exception:
+        raise ValueError("Invalid URL")
+
+
 def _vault_transit_encrypt(plaintext_bytes: bytes, key_name: str) -> Optional[str]:
     """Encrypt plaintext (bytes) using Vault transit; returns ciphertext string on success."""
     if not VAULT_ADDR or not VAULT_TOKEN:
@@ -70,7 +103,7 @@ def _vault_transit_encrypt(plaintext_bytes: bytes, key_name: str) -> Optional[st
 def _vault_transit_decrypt(ciphertext: str, key_name: str) -> Optional[bytes]:
     if not VAULT_ADDR or not VAULT_TOKEN:
         return None
-    url = VAULT_ADDR.rstrip('/') + f"/v1/transit/decrypt/{key_name}"
+    url = _build_vault_transit_url(VAULT_ADDR.rstrip('/'), "decrypt", key_name)
     payload = json.dumps({
         "ciphertext": ciphertext
     }).encode('utf-8')
